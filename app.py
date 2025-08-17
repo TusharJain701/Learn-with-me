@@ -72,7 +72,7 @@ qa_pipeline = load_qa_model()
 def generate_qa(text: str, num_questions: int = 5) -> List[List[str]]:
     qa_pairs = []
     attempts = 0
-    max_attempts = num_questions * 3  # Increased max attempts
+    max_attempts = num_questions * 3
     
     # Split text into chunks for variation
     chunk_size = 1000
@@ -81,78 +81,111 @@ def generate_qa(text: str, num_questions: int = 5) -> List[List[str]]:
     while len(qa_pairs) < num_questions and attempts < max_attempts:
         attempts += 1
         
-        # Select random chunk with context
-        context_chunk = random.choice(text_chunks) if text_chunks else text
-        
-        # Create varied prompt templates
-        prompt_templates = [
-            f"Generate one multiple-choice question with 3 wrong options from: {context_chunk}",
-            f"Create a quiz question with 4 choices from this text: {context_chunk}",
-            f"From the following text, make a MCQ with one correct and three wrong answers: {context_chunk}"
-        ]
-        
-        prompt = random.choice(prompt_templates) + "\nUse format:\nQUESTION: [question]?\nA) [option]\nB) [option]\nC) [option]\nD) [option]\nANSWER: [letter]"
-
-        result = qa_pipeline(
-            prompt,
-            max_length=512,
-            do_sample=True,
-            temperature=0.85,  # Increased for more randomness
-            top_k=50,          # Broader sampling
-            num_return_sequences=1
-        )
-        
-        qa_text = result[0]['generated_text'].strip()
-        question_data = parse_any_format(qa_text)
-        
-        # Only add unique questions
-        if question_data and not any(q[0] == question_data[0] for q in qa_pairs):
-            qa_pairs.append(question_data)
+        try:
+            # Select random chunk with context
+            context_chunk = random.choice(text_chunks) if text_chunks else text
             
+            # Create varied prompt templates
+            prompt_templates = [
+                f"Generate one multiple-choice question with 3 options and mark the correct answer from: {context_chunk}",
+                f"Create a quiz question with 4 choices (1 correct, 3 wrong) from this text: {context_chunk}",
+                f"From the following text, make a MCQ with one correct and two wrong answers: {context_chunk}\nFormat: Question? A) Option1 B) Option2 C) Option3 (Answer: A)"
+            ]
+            
+            prompt = random.choice(prompt_templates)
+
+            result = qa_pipeline(
+                prompt,
+                max_length=512,
+                do_sample=True,
+                temperature=0.85,
+                top_k=50,
+                num_return_sequences=1
+            )
+            
+            qa_text = result[0]['generated_text'].strip()
+            question_data = parse_any_format(qa_text)
+            
+            # Only add valid and unique questions
+            if question_data and not any(q[0] == question_data[0] for q in qa_pairs):
+                qa_pairs.append(question_data)
+                
+        except Exception as e:
+            st.warning(f"Error generating question: {str(e)}")
+            continue
+            
+    if not qa_pairs and attempts >= max_attempts:
+        st.error("Failed to generate flashcards after multiple attempts. The text might be too short or complex.")
+    
     return qa_pairs[:num_questions]
 
 def parse_any_format(qa_text: str) -> Optional[List[str]]:
     """
-    Flexible parser that handles multiple question format variations
+    More robust parser that handles multiple question format variations from LLM output
     """
-    formats = [
-        # Format 1: Strict Q&A with markers for options and answer
-        r'(?:Question|QUESTION)[:\s]*(.*?)\s*'
-        r'(?:A\)|A[)\s])(.*?)\s*'
-        r'(?:B\)|B[)\s])(.*?)\s*'
-        r'(?:C\)|C[)\s])(.*?)\s*'
-        r'(?:Answer|ANSWER)[:\s]*([A-D])',
-        
-        # Format 2: Colon separated options
-        r'(.*\?)\s*A:\s*(.*?)\s*B:\s*(.*?)\s*C:\s*(.*?)\s*Ans:\s*([A-C])',
-        
-        # Format 3: Numbered options
-        r'(.*\?)\s*1.\s*(.*?)\s*2.\s*(.*?)\s*3.\s*(.*?)\s*Correct:\s*([1-3])'
+    # Normalize the text first
+    qa_text = qa_text.replace("\n", " ").strip()
+    
+    # Try to extract question and options using more flexible patterns
+    question_match = re.search(r'^(.*?\?)', qa_text)
+    if not question_match:
+        return None
+    
+    question = question_match.group(1).strip()
+    
+    # Try to find options in various formats
+    option_patterns = [
+        r'[A-D][):.]?\s*(.*?)(?:\s*(?:[A-D][):.]|$))',  # A) option1 B) option2
+        r'\d[.:]\s*(.*?)(?:\s*(?:\d[.:]|$))',          # 1. option1 2. option2
+        r'-\s*(.*?)(?:\s*(?:-|$))',                    # - option1 - option2
+        r'option\s*\w\s*:\s*(.*?)(?:\s*(?:option\s*\w\s*:|$))'  # option A: option1 option B: option2
     ]
     
-    for fmt in formats:
-        match = re.search(fmt, qa_text, re.IGNORECASE | re.DOTALL)
-        if match:
-            question = match.group(1).strip()
-            options = [match.group(2).strip(), 
-                       match.group(3).strip(), 
-                       match.group(4).strip()]
-            # Determine correct answer index either from letter or number
-            if match.group(5).isalpha():
-                correct_idx = ord(match.group(5).upper()) - ord('A')
+    options = []
+    for pattern in option_patterns:
+        options = re.findall(pattern, qa_text, re.IGNORECASE)
+        if len(options) >= 3:  # We need at least 3 options
+            break
+    
+    if len(options) < 3:
+        # Fallback - just take the text after question as options
+        remaining_text = qa_text[len(question):].strip()
+        if remaining_text:
+            options = remaining_text.split()[:3]
+        else:
+            options = ["Correct answer", "Wrong option 1", "Wrong option 2"]
+    
+    # Try to identify correct answer (look for "answer:" or similar)
+    answer_patterns = [
+        r'answer\s*[:\-]\s*([A-D1-3])',
+        r'correct\s*[:\-]\s*([A-D1-3])',
+        r'right\s*[:\-]\s*([A-D1-3])'
+    ]
+    
+    correct_idx = 0  # default to first option if we can't determine
+    for pattern in answer_patterns:
+        answer_match = re.search(pattern, qa_text, re.IGNORECASE)
+        if answer_match:
+            answer = answer_match.group(1).upper()
+            if answer.isdigit():
+                correct_idx = int(answer) - 1
             else:
-                correct_idx = int(match.group(5)) - 1
-            correct = options[correct_idx]
-            wrongs = [opt for i, opt in enumerate(options) if i != correct_idx]
-            return [question, correct, wrongs[0], wrongs[1] if len(wrongs) > 1 else "N/A"]
+                correct_idx = ord(answer) - ord('A')
+            correct_idx = max(0, min(correct_idx, len(options)-1))
+            break
     
-    # Fallback if "?" found
-    if "?" in qa_text:
-        parts = qa_text.split("?")
-        question = parts[0] + "?"
-        return [question, "Correct answer", "Wrong option 1", "Wrong option 2"]
+    # Ensure we have at least 3 options
+    while len(options) < 3:
+        options.append(f"Option {len(options)+1}")
     
-    return None
+    correct = options[correct_idx]
+    wrongs = [opt for i, opt in enumerate(options) if i != correct_idx]
+    
+    # Ensure we have at least 2 wrong options
+    while len(wrongs) < 2:
+        wrongs.append(f"Wrong option {len(wrongs)+1}")
+    
+    return [question, correct, wrongs[0], wrongs[1]]
 
 # --- Helper functions for Flash Cards DB operations ---
 
