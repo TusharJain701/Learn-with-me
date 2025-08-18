@@ -1,7 +1,8 @@
 # --- IMPORTS ---
 import sqlite3
 import re
-from typing import Optional, List
+import os
+from typing import Optional, List, Dict, Tuple
 import streamlit as st
 import pandas as pd
 import docx2txt
@@ -9,28 +10,57 @@ from PyPDF2 import PdfReader
 import torch
 from transformers import pipeline
 import random
+from datetime import datetime
 
 # --- SQLite SETUP ---
-
-# Connect SQLite database file for storing flashcards
-conn = sqlite3.connect("flashcards.db", check_same_thread=False)
+# Connect SQLite database file for storing flashcards and quiz data
+DB_PATH = "learning.db"
+conn = sqlite3.connect(DB_PATH, check_same_thread=False)
 cursor = conn.cursor()
-cursor.execute("""CREATE TABLE IF NOT EXISTS flashcards 
-               (
-               id INTEGER PRIMARY KEY AUTOINCREMENT,
-               question TEXT,
-               correct_answer TEXT,
-               wrong1 TEXT,
-               wrong2 TEXT,
-               difficulty TEXT
-               )""")
-conn.commit()
+
+# --- DATABASE INITIALIZATION ---
+def initialize_database():
+    """Initialize or reset the database tables"""
+    cursor.execute("""CREATE TABLE IF NOT EXISTS flashcards 
+                   (
+                   id INTEGER PRIMARY KEY AUTOINCREMENT,
+                   question TEXT,
+                   correct_answer TEXT,
+                   wrong1 TEXT,
+                   wrong2 TEXT,
+                   difficulty TEXT,
+                   created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                   last_reviewed TIMESTAMP,
+                   review_count INTEGER DEFAULT 0
+                   )""")
+
+    cursor.execute("""CREATE TABLE IF NOT EXISTS quiz_sessions 
+                   (
+                   id INTEGER PRIMARY KEY AUTOINCREMENT,
+                   session_name TEXT,
+                   created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                   completed BOOLEAN DEFAULT FALSE,
+                   score INTEGER
+                   )""")
+
+    cursor.execute("""CREATE TABLE IF NOT EXISTS quiz_questions 
+                   (
+                   id INTEGER PRIMARY KEY AUTOINCREMENT,
+                   session_id INTEGER,
+                   flashcard_id INTEGER,
+                   user_answer TEXT,
+                   is_correct BOOLEAN,
+                   FOREIGN KEY(session_id) REFERENCES quiz_sessions(id),
+                   FOREIGN KEY(flashcard_id) REFERENCES flashcards(id)
+                   )""")
+    conn.commit()
+
+# Initialize database tables
+initialize_database()
 
 # --- TEXT PROCESSING FUNCTIONS ---
 def extract_text(file):
-    """
-    Extracts text from uploaded files (PDF, DOCX, or TXT)
-    """
+    """Extracts text from uploaded files (PDF, DOCX, or TXT)"""
     text = ""
     if file.type == "application/pdf":
         pdf_reader = PdfReader(file)
@@ -47,9 +77,7 @@ def extract_text(file):
     return text
 
 def clean_text(text):
-    """
-    Cleans and normalizes extracted text
-    """
+    """Cleans and normalizes extracted text"""
     text = text.lower()  
     text = re.sub(r'\s+', ' ', text)  
     return text.strip()
@@ -57,24 +85,22 @@ def clean_text(text):
 # --- QA GENERATION FUNCTIONS ---
 @st.cache_resource
 def load_qa_model():
-    """
-    Loads and caches the Hugging Face question generation model
-    """
+    """Loads and caches the Hugging Face question generation model"""
     device = 0 if torch.cuda.is_available() else -1
     return pipeline(
         "text2text-generation",
-        model="google/flan-t5-base",  # may use google/flan-t5-small due to lack of vram and cuda cores 
+        model="google/flan-t5-base",
         device=device
     )
-# Initialize the model pipeline
+
 qa_pipeline = load_qa_model()  
 
 def generate_qa(text: str, num_questions: int = 5) -> List[List[str]]:
+    """Generates quiz questions from text"""
     qa_pairs = []
     attempts = 0
     max_attempts = num_questions * 3
     
-    # Split text into chunks for variation
     chunk_size = 1000
     text_chunks = [text[i:i+chunk_size] for i in range(0, len(text), chunk_size)] if len(text) > chunk_size else [text]
     
@@ -82,10 +108,8 @@ def generate_qa(text: str, num_questions: int = 5) -> List[List[str]]:
         attempts += 1
         
         try:
-            # Select random chunk with context
             context_chunk = random.choice(text_chunks) if text_chunks else text
             
-            # Create varied prompt templates
             prompt_templates = [
                 f"Generate one multiple-choice question with 3 options and mark the correct answer from: {context_chunk}",
                 f"Create a quiz question with 4 choices (1 correct, 3 wrong) from this text: {context_chunk}",
@@ -106,7 +130,6 @@ def generate_qa(text: str, num_questions: int = 5) -> List[List[str]]:
             qa_text = result[0]['generated_text'].strip()
             question_data = parse_any_format(qa_text)
             
-            # Only add valid and unique questions
             if question_data and not any(q[0] == question_data[0] for q in qa_pairs):
                 qa_pairs.append(question_data)
                 
@@ -120,49 +143,42 @@ def generate_qa(text: str, num_questions: int = 5) -> List[List[str]]:
     return qa_pairs[:num_questions]
 
 def parse_any_format(qa_text: str) -> Optional[List[str]]:
-    """
-    More robust parser that handles multiple question format variations from LLM output
-    """
-    # Normalize the text first
+    """Parses generated questions into standardized format"""
     qa_text = qa_text.replace("\n", " ").strip()
     
-    # Try to extract question and options using more flexible patterns
     question_match = re.search(r'^(.*?\?)', qa_text)
     if not question_match:
         return None
     
     question = question_match.group(1).strip()
     
-    # Try to find options in various formats
     option_patterns = [
-        r'[A-D][):.]?\s*(.*?)(?:\s*(?:[A-D][):.]|$))',  # A) option1 B) option2
-        r'\d[.:]\s*(.*?)(?:\s*(?:\d[.:]|$))',          # 1. option1 2. option2
-        r'-\s*(.*?)(?:\s*(?:-|$))',                    # - option1 - option2
-        r'option\s*\w\s*:\s*(.*?)(?:\s*(?:option\s*\w\s*:|$))'  # option A: option1 option B: option2
+        r'[A-D][):.]?\s*(.*?)(?:\s*(?:[A-D][):.]|$))',
+        r'\d[.:]\s*(.*?)(?:\s*(?:\d[.:]|$))',
+        r'-\s*(.*?)(?:\s*(?:-|$))',
+        r'option\s*\w\s*:\s*(.*?)(?:\s*(?:option\s*\w\s*:|$))'
     ]
     
     options = []
     for pattern in option_patterns:
         options = re.findall(pattern, qa_text, re.IGNORECASE)
-        if len(options) >= 3:  # We need at least 3 options
+        if len(options) >= 3:
             break
     
     if len(options) < 3:
-        # Fallback - just take the text after question as options
         remaining_text = qa_text[len(question):].strip()
         if remaining_text:
             options = remaining_text.split()[:3]
         else:
             options = ["Correct answer", "Wrong option 1", "Wrong option 2"]
     
-    # Try to identify correct answer (look for "answer:" or similar)
     answer_patterns = [
         r'answer\s*[:\-]\s*([A-D1-3])',
         r'correct\s*[:\-]\s*([A-D1-3])',
         r'right\s*[:\-]\s*([A-D1-3])'
     ]
     
-    correct_idx = 0  # default to first option if we can't determine
+    correct_idx = 0
     for pattern in answer_patterns:
         answer_match = re.search(pattern, qa_text, re.IGNORECASE)
         if answer_match:
@@ -174,55 +190,169 @@ def parse_any_format(qa_text: str) -> Optional[List[str]]:
             correct_idx = max(0, min(correct_idx, len(options)-1))
             break
     
-    # Ensure we have at least 3 options
     while len(options) < 3:
         options.append(f"Option {len(options)+1}")
     
     correct = options[correct_idx]
     wrongs = [opt for i, opt in enumerate(options) if i != correct_idx]
     
-    # Ensure we have at least 2 wrong options
     while len(wrongs) < 2:
         wrongs.append(f"Wrong option {len(wrongs)+1}")
     
     return [question, correct, wrongs[0], wrongs[1]]
 
-# --- Helper functions for Flash Cards DB operations ---
-
+# --- DATABASE OPERATIONS ---
 def save_flashcard(question, correct, wrong1, wrong2, difficulty):
+    """Saves a new flashcard to database"""
     cursor.execute(
-        "INSERT INTO flashcards (question, correct_answer, wrong1, wrong2, difficulty) VALUES (?, ?, ?, ?, ?)",
+        """INSERT INTO flashcards 
+        (question, correct_answer, wrong1, wrong2, difficulty) 
+        VALUES (?, ?, ?, ?, ?)""",
         (question, correct, wrong1, wrong2, difficulty)
     )
     conn.commit()
 
-def get_flashcards():
-    df = pd.read_sql_query("SELECT * FROM flashcards", conn)
+def get_flashcards(filter_difficulty=None):
+    """Retrieves flashcards with optional difficulty filter"""
+    query = "SELECT * FROM flashcards"
+    params = ()
+    
+    if filter_difficulty:
+        query += " WHERE difficulty = ?"
+        params = (filter_difficulty,)
+        
+    query += " ORDER BY last_reviewed ASC, review_count ASC"
+    df = pd.read_sql_query(query, conn, params=params)
     return df
 
 def update_flashcard(card_id, question, correct, wrong1, wrong2, difficulty):
+    """Updates an existing flashcard"""
     cursor.execute(
-        "UPDATE flashcards SET question=?, correct_answer=?, wrong1=?, wrong2=?, difficulty=? WHERE id=?",
+        """UPDATE flashcards 
+        SET question=?, correct_answer=?, wrong1=?, wrong2=?, difficulty=?, last_reviewed=CURRENT_TIMESTAMP 
+        WHERE id=?""",
         (question, correct, wrong1, wrong2, difficulty, card_id)
     )
     conn.commit()
 
 def delete_flashcard(card_id):
+    """Deletes a flashcard from database"""
     cursor.execute("DELETE FROM flashcards WHERE id=?", (card_id,))
     conn.commit()
 
-# --- PAGE CONFIG ---
-st.set_page_config(page_title="📚",page_icon="📚")
-# --- SIDE BAR NAVIGATION ---
-page = st.sidebar.radio("Navigation", ["Generate Flashcards", "View/Edit Flashcards"])
+def create_quiz_session(session_name):
+    """Creates a new quiz session"""
+    cursor.execute(
+        "INSERT INTO quiz_sessions (session_name) VALUES (?)",
+        (session_name,)
+    )
+    conn.commit()
+    return cursor.lastrowid
 
-# --- PAGE: Generate Flashcards ---
-if page == "Generate Flashcards":
-    st.set_page_config(page_title="Generate Flashcards", layout="centered")
+def add_question_to_quiz(session_id, flashcard_id):
+    """Adds a question to a quiz session"""
+    cursor.execute(
+        """INSERT INTO quiz_questions (session_id, flashcard_id) 
+        VALUES (?, ?)""",
+        (session_id, flashcard_id)
+    )
+    conn.commit()
+
+def record_quiz_answer(question_id, user_answer, is_correct):
+    """Records a user's answer to a quiz question"""
+    cursor.execute(
+        """UPDATE quiz_questions 
+        SET user_answer=?, is_correct=? 
+        WHERE id=?""",
+        (user_answer, is_correct, question_id)
+    )
+    conn.commit()
+
+def complete_quiz_session(session_id, score):
+    """Marks a quiz session as completed with score"""
+    cursor.execute(
+        """UPDATE quiz_sessions 
+        SET completed=TRUE, score=? 
+        WHERE id=?""",
+        (score, session_id)
+    )
+    conn.commit()
+
+def get_quiz_session(session_id):
+    """Gets quiz session details"""
+    cursor.execute("SELECT * FROM quiz_sessions WHERE id=?", (session_id,))
+    return cursor.fetchone()
+
+def get_quiz_questions(session_id):
+    """Gets all questions for a quiz session"""
+    df = pd.read_sql_query(
+        """SELECT q.id, q.session_id, q.flashcard_id, q.user_answer, q.is_correct,
+           f.question, f.correct_answer, f.wrong1, f.wrong2, f.difficulty
+           FROM quiz_questions q
+           JOIN flashcards f ON q.flashcard_id = f.id
+           WHERE q.session_id = ?""",
+        conn, params=(session_id,)
+    )
+    return df
+
+def get_quiz_history():
+    """Gets history of completed quizzes"""
+    df = pd.read_sql_query(
+        "SELECT id, session_name, created_at, score FROM quiz_sessions WHERE completed=TRUE ORDER BY created_at DESC",
+        conn
+    )
+    return df
+
+# --- QUIZ FUNCTIONS ---
+def generate_quiz_questions(difficulty=None, limit=10):
+    """Selects questions for a new quiz"""
+    query = "SELECT * FROM flashcards"
+    params = ()
+    
+    if difficulty:
+        query += " WHERE difficulty = ?"
+        params = (difficulty,)
+        
+    query += " ORDER BY RANDOM() LIMIT ?"
+    params += (limit,)
+    
+    df = pd.read_sql_query(query, conn, params=params)
+    return df.to_dict('records')
+
+def calculate_quiz_score(session_id):
+    """Calculates score for a quiz session"""
+    cursor.execute(
+        "SELECT COUNT(*) FROM quiz_questions WHERE session_id=? AND is_correct=TRUE",
+        (session_id,)
+    )
+    correct = cursor.fetchone()[0]
+    
+    cursor.execute(
+        "SELECT COUNT(*) FROM quiz_questions WHERE session_id=?",
+        (session_id,)
+    )
+    total = cursor.fetchone()[0]
+    
+    return int((correct / total) * 100) if total > 0 else 0
+
+# --- STREAMLIT PAGES ---
+def generate_flashcards_page():
+    """Page for generating flashcards from documents"""
     st.title("📄 Flashcard Generator")
     st.info("Upload a document, choose how many questions you want, and then generate flashcards. Pick the ones you want to keep!")
 
-    # File Upload
+    # Debugging and reset options
+    with st.sidebar.expander("Developer Tools"):
+        if st.button("🔄 Clear All Cache"):
+            st.cache_data.clear()
+            st.cache_resource.clear()
+            st.session_state.clear()
+            st.success("All caches cleared!")
+        
+        if st.button("💣 Reset Entire Database"):
+            initialize_database()
+            st.success("Database reset complete!")
+
     uploaded_file = st.file_uploader(
         "Upload a document (PDF, DOCX, or TXT)", 
         type=["pdf", "docx", "txt"],
@@ -238,22 +368,22 @@ if page == "Generate Flashcards":
             ("Show Extracted Text", "Show Cleaned Text"),
             horizontal=True
         )
+        
         if view_option == "Show Extracted Text":
             st.subheader("📜 Extracted Text")
             st.text(extracted_text)
             st.download_button(label="Download Extracted Text",
-                               data=extracted_text,
-                               file_name="extracted_text.txt",
-                               mime="text/plain")
+                             data=extracted_text,
+                             file_name="extracted_text.txt",
+                             mime="text/plain")
         else:
             st.subheader("✨ Cleaned Text")
             st.text(cleaned)
             st.download_button(label="Download Cleaned Text",
-                               data=cleaned,
-                               file_name="cleaned_text.txt",
-                               mime="text/plain")            
+                             data=cleaned,
+                             file_name="cleaned_text.txt",
+                             mime="text/plain")            
     
-        # Numerical Input for Number of Questions
         num_questions = st.number_input("Number of questions to generate", min_value=1, max_value=20, value=5, step=1)
     
         if st.button("Generate Quiz"):
@@ -268,10 +398,9 @@ if page == "Generate Flashcards":
                     else:
                         st.error("Failed to generate flashcards. Try with different text.")
     
-    # Display generated flashcards with option to keep/dispose and select difficulty
     if "qa_pairs" in st.session_state:
         st.subheader("📝 Generated Flashcards")
-        flashcards_to_save = []  # Collect the ones the user wants to keep
+        flashcards_to_save = []
         with st.form("save_flashcards_form"):
             for i, (question, correct, wrong1, wrong2) in enumerate(st.session_state.qa_pairs, 1):
                 with st.expander(f"Flashcard {i}: {question}", expanded=False):
@@ -279,8 +408,9 @@ if page == "Generate Flashcards":
                     st.markdown(f"**Correct Answer:** {correct}")
                     st.markdown(f"**Option 1:** {wrong1}")
                     st.markdown(f"**Option 2:** {wrong2}")
-                    difficulty = st.selectbox(f"Select difficulty for flashcard {i}", 
-                                              ["Easy", "Medium", "Hard"], key=f"diff_{i}")
+                    difficulty = st.selectbox(f"Select difficulty", 
+                                            ["Easy", "Medium", "Hard"], 
+                                            key=f"diff_{i}")
                     save_option = st.checkbox("Keep this flashcard?", key=f"keep_{i}")
                     
                     if save_option:
@@ -296,44 +426,336 @@ if page == "Generate Flashcards":
                 if flashcards_to_save:
                     for card in flashcards_to_save:
                         save_flashcard(card["question"], card["correct"], card["wrong1"], card["wrong2"], card["difficulty"])
-                    st.success("Selected flashcards saved!")
-                   
-                    # Fun animations!
+                    st.success(f"Saved {len(flashcards_to_save)} flashcards!")
                     st.balloons()
+                    del st.session_state.qa_pairs
+                    st.rerun()
                 else:
                     st.info("No flashcards selected to save.")
 
-# --- PAGE: View/Edit Flashcards ---
-elif page == "View/Edit Flashcards":
-    st.set_page_config(page_title="View/Edit Flashcards", layout="centered")
-    st.title("🗄️ Saved Flashcards")
-    st.info("Edit or delete your saved flashcards below.")
+def manage_flashcards_page():
+    """Page for managing existing flashcards"""
+    st.title("🗄️ Flashcards Management")
+    st.info("Edit, delete, or organize your saved flashcards below.")
     
-    df = get_flashcards()
+    # Debugging and reset options
+    with st.sidebar.expander("Developer Tools"):
+        if st.button("🔄 Clear All Cache"):
+            st.cache_data.clear()
+            st.cache_resource.clear()
+            st.session_state.clear()
+            st.success("All caches cleared!")
+        
+        if st.button("💣 Reset Entire Database"):
+            initialize_database()
+            st.success("Database reset complete!")
+    
+    # Add filter options
+    col1, col2 = st.columns(2)
+    with col1:
+        filter_difficulty = st.selectbox(
+            "Filter by difficulty",
+            ["All", "Easy", "Medium", "Hard"],
+            index=0
+        )
+    
+    with col2:
+        sort_option = st.selectbox(
+            "Sort by",
+            ["Recently Added", "Least Reviewed", "Difficulty"],
+            index=0
+        )
+    
+    # Get filtered flashcards
+    difficulty = filter_difficulty if filter_difficulty != "All" else None
+    df = get_flashcards(difficulty)
+    
     if df.empty:
-        st.warning("No flashcards saved yet.")
+        st.warning("No flashcards found. Generate some first!")
     else:
+        st.write(f"Found {len(df)} flashcards")
+        
         # Display flashcards in individual expanders with edit options
         for index, row in df.iterrows():
-            with st.expander(f"Flashcard {row['id']}: {row['question']}", expanded=False):
-                # Create an editable form for each card
+            with st.expander(f"Card #{row['id']} ({row['difficulty']}): {row['question']}", expanded=False):
                 with st.form(key=f"edit_form_{row['id']}"):
                     new_question = st.text_area("Question", row["question"], key=f"question_{row['id']}")
                     new_correct = st.text_input("Correct Answer", row["correct_answer"], key=f"correct_{row['id']}")
                     new_wrong1 = st.text_input("Wrong Option 1", row["wrong1"], key=f"wrong1_{row['id']}")
                     new_wrong2 = st.text_input("Wrong Option 2", row["wrong2"], key=f"wrong2_{row['id']}")
-                    new_diff = st.selectbox("Difficulty", ["Easy", "Medium", "Hard"], index=["Easy", "Medium", "Hard"].index(row["difficulty"]), key=f"diff_{row['id']}")
-                    col1, col2 = st.columns(2)
+                    new_diff = st.selectbox(
+                        "Difficulty", 
+                        ["Easy", "Medium", "Hard"], 
+                        index=["Easy", "Medium", "Hard"].index(row["difficulty"]), 
+                        key=f"diff_{row['id']}"
+                    )
+                    
+                    col1, col2, col3 = st.columns(3)
                     with col1:
                         update_btn = st.form_submit_button("Update")
                     with col2:
                         delete_btn = st.form_submit_button("Delete")
+                    with col3:
+                        quiz_btn = st.form_submit_button("Add to Quiz")
                     
                     if update_btn:
                         update_flashcard(row['id'], new_question, new_correct, new_wrong1, new_wrong2, new_diff)
                         st.success("Flashcard updated!")
-                        st.experimental_rerun()
+                        st.rerun()
                     if delete_btn:
                         delete_flashcard(row['id'])
                         st.success("Flashcard deleted!")
-                        st.experimental_rerun()
+                        st.rerun()
+                    if quiz_btn:
+                        if "quiz_flashcards" not in st.session_state:
+                            st.session_state.quiz_flashcards = []
+                        st.session_state.quiz_flashcards.append(row['id'])
+                        st.success("Added to quiz selection!")
+
+def quiz_page():
+    """Page for taking and reviewing quizzes"""
+    st.title("🎯 Quiz Mode")
+    
+    # Debugging and reset options
+    with st.sidebar.expander("Developer Tools"):
+        if st.button("🔄 Clear All Cache"):
+            st.cache_data.clear()
+            st.cache_resource.clear()
+            st.session_state.clear()
+            st.success("All caches cleared!")
+        
+        if st.button("💣 Reset Entire Database"):
+            initialize_database()
+            st.success("Database reset complete!")
+    
+    # Initialize session state for quiz if not exists
+    if "current_quiz" not in st.session_state:
+        st.session_state.current_quiz = {
+            "session_id": None,
+            "questions": [],
+            "current_question": 0,
+            "answers": {},
+            "completed": False
+        }
+    
+    # Quiz creation section
+    if st.session_state.current_quiz["session_id"] is None:
+        st.info("Create a new quiz or review past quiz attempts.")
+        
+        tab1, tab2 = st.tabs(["New Quiz", "Quiz History"])
+        
+        with tab1:
+            st.subheader("Create New Quiz")
+            
+            # Quiz configuration
+            col1, col2 = st.columns(2)
+            with col1:
+                quiz_name = st.text_input("Quiz Name", "My Quiz")
+                question_count = st.slider("Number of Questions", 5, 20, 10)
+            
+            with col2:
+                difficulty = st.selectbox(
+                    "Difficulty Level",
+                    ["All", "Easy", "Medium", "Hard"],
+                    index=0
+                )
+                include_selected = st.checkbox("Include selected flashcards", value=True)
+            
+            if st.button("Start Quiz"):
+                # Create a new quiz session
+                session_id = create_quiz_session(quiz_name)
+                
+                # Get questions for the quiz
+                selected_questions = []
+                
+                # Add manually selected flashcards if any
+                if include_selected and "quiz_flashcards" in st.session_state:
+                    for card_id in st.session_state.quiz_flashcards:
+                        add_question_to_quiz(session_id, card_id)
+                    selected_questions.extend(st.session_state.quiz_flashcards)
+                    del st.session_state.quiz_flashcards
+                
+                # Get remaining questions randomly
+                remaining = question_count - len(selected_questions)
+                if remaining > 0:
+                    diff = difficulty if difficulty != "All" else None
+                    questions = generate_quiz_questions(diff, remaining)
+                    for q in questions:
+                        add_question_to_quiz(session_id, q['id'])
+                
+                # Initialize the quiz in session state
+                questions_df = get_quiz_questions(session_id)
+                st.session_state.current_quiz = {
+                    "session_id": session_id,
+                    "questions": questions_df.to_dict('records'),
+                    "current_question": 0,
+                    "answers": {},
+                    "completed": False
+                }
+                
+                st.rerun()
+        
+        with tab2:
+            st.subheader("Quiz History")
+            history_df = get_quiz_history()
+            
+            if history_df.empty:
+                st.info("No quiz history yet.")
+            else:
+                for _, row in history_df.iterrows():
+                    with st.expander(f"{row['session_name']} - Score: {row['score']}% - {row['created_at']}"):
+                        st.write(f"Date: {row['created_at']}")
+                        st.write(f"Score: {row['score']}%")
+                        if st.button(f"Review Quiz #{row['id']}"):
+                            # Load the quiz for review
+                            questions_df = get_quiz_questions(row['id'])
+                            st.session_state.current_quiz = {
+                                "session_id": row['id'],
+                                "questions": questions_df.to_dict('records'),
+                                "current_question": 0,
+                                "answers": {q['id']: q['user_answer'] for _, q in questions_df.iterrows()},
+                                "completed": True
+                            }
+                            st.rerun()
+    
+    # Quiz taking/review section
+    else:
+        quiz = st.session_state.current_quiz
+        questions = quiz["questions"]
+        current_idx = quiz["current_question"]
+        question_data = questions[current_idx]
+        
+        # Clean question text by removing any existing answer prefixes
+        clean_question = re.sub(r'[A-Z]\)\s*', '', question_data['question']).strip()
+        
+        # Display progress
+        st.progress((current_idx + 1) / len(questions))
+        st.caption(f"Question {current_idx + 1} of {len(questions)}")
+        
+        # Display the cleaned question
+        st.subheader(clean_question)
+        
+        # Prepare answer options with identifiers
+        options = [
+            ("A", question_data['correct_answer'].strip()),
+            ("B", question_data['wrong1'].strip()),
+            ("C", question_data['wrong2'].strip())
+        ]
+        random.shuffle(options)
+
+        # Find correct answer key
+        correct_answer_key = next(key for key, val in options if val == question_data['correct_answer'].strip())
+
+        # If reviewing a completed quiz
+        if quiz["completed"]:
+            user_answer_key = quiz["answers"].get(question_data['id'])
+            was_correct = user_answer_key == correct_answer_key
+            
+            # Display user's answer and correct answer
+            st.markdown(f"**Your answer:** {user_answer_key}) {next(val for k, val in options if k == user_answer_key)}")
+            st.markdown(f"**Correct answer:** {correct_answer_key}) {question_data['correct_answer']}")
+            
+            if was_correct:
+                st.success("✅ You got this right!")
+            else:
+                st.error("❌ You missed this one.")
+            
+            # Navigation buttons
+            col1, col2, col3 = st.columns([1,1,2])
+            with col1:
+                if st.button("⏮️ Previous") and current_idx > 0:
+                    st.session_state.current_quiz["current_question"] -= 1
+                    st.rerun()
+            with col2:
+                if st.button("⏭️ Next") and current_idx < len(questions) - 1:
+                    st.session_state.current_quiz["current_question"] += 1
+                    st.rerun()
+            with col3:
+                if st.button("🏁 Finish Review"):
+                    del st.session_state.current_quiz
+                    st.rerun()
+        
+        # If taking the quiz
+        else:
+            selected = st.radio(
+                "Select your answer:",
+                options=[f"{key}) {value}" for key, value in options],
+                key=f"answer_{question_data['id']}"
+            )
+            
+            # Extract selected answer key
+            user_answer_key = selected[0]
+            
+            # Navigation buttons
+            col1, col2, col3 = st.columns([1,1,2])
+            with col1:
+                if st.button("⏮️ Previous") and current_idx > 0:
+                    st.session_state.current_quiz["current_question"] -= 1
+                    st.rerun()
+            with col2:
+                if current_idx < len(questions) - 1:
+                    if st.button("⏭️ Next"):
+                        # Record answer
+                        st.session_state.current_quiz["answers"][question_data['id']] = user_answer_key
+                        st.session_state.current_quiz["current_question"] += 1
+                        st.rerun()
+                else:
+                    if st.button("✅ Submit Quiz"):
+                        # Record final answer
+                        st.session_state.current_quiz["answers"][question_data['id']] = user_answer_key
+                        
+                        # Calculate score
+                        correct = sum(
+                            1 for q in questions
+                            if st.session_state.current_quiz["answers"].get(q['id']) == 
+                            next(key for key, val in [
+                                ("A", q['correct_answer']),
+                                ("B", q['wrong1']),
+                                ("C", q['wrong2'])
+                            ] if val == q['correct_answer'])
+                        )
+                        
+                        score = int((correct / len(questions)) * 100)
+                        complete_quiz_session(quiz["session_id"], score)
+                        
+                        # Mark as completed
+                        st.session_state.current_quiz["completed"] = True
+                        st.session_state.current_quiz["current_question"] = 0
+                        
+                        st.success(f"Quiz completed! Your score: {score}%")
+                        st.balloons()
+                        st.rerun()
+            with col3:
+                if st.button("❌ Cancel Quiz"):
+                    cursor.execute("DELETE FROM quiz_sessions WHERE id=?", (quiz["session_id"],))
+                    cursor.execute("DELETE FROM quiz_questions WHERE session_id=?", (quiz["session_id"],))
+                    conn.commit()
+                    del st.session_state.current_quiz
+                    st.rerun()
+
+# --- MAIN APP ---
+def main():
+    st.set_page_config(
+        page_title="Learn-with-me App",
+        page_icon="📚",
+        layout="centered"
+    )
+    
+    # Sidebar navigation
+    st.sidebar.title("Navigation")
+    page = st.sidebar.radio(
+        "Go to",
+        ["Generate Flashcards", "Manage Flashcards", "Quiz Mode"],
+        index=0
+    )
+    
+    # Display the selected page
+    if page == "Generate Flashcards":
+        generate_flashcards_page()
+    elif page == "Manage Flashcards":
+        manage_flashcards_page()
+    elif page == "Quiz Mode":
+        quiz_page()
+
+if __name__ == "__main__":
+    main()

@@ -1,5 +1,10 @@
-streamlit
-transformers
-torch --index-url https://download.pytorch.org/whl/cu118
-docx2txt
-PyPDF2
+streamlit==1.32.2
+sqlite3==2.6.0
+pandas==2.1.4
+python-docx==0.8.11
+PyPDF2==3.0.1
+transformers==4.36.2
+torch==2.1.2
+numpy==1.26.3
+tqdm==4.66.1
+protobuf==3.20.
