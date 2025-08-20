@@ -3,6 +3,7 @@ import sqlite3
 import re
 import os
 from typing import Optional, List, Dict, Tuple
+from datetime import datetime, timedelta
 import streamlit as st
 import pandas as pd
 import docx2txt
@@ -10,7 +11,7 @@ from PyPDF2 import PdfReader
 import torch
 from transformers import pipeline
 import random
-from datetime import datetime
+import plotly.express as px
 
 # --- SQLite SETUP ---
 # Connect SQLite database file for storing flashcards and quiz data
@@ -19,6 +20,7 @@ conn = sqlite3.connect(DB_PATH, check_same_thread=False)
 cursor = conn.cursor()
 
 # --- DATABASE INITIALIZATION ---
+
 def initialize_database():
     """Initialize or reset the database tables"""
     cursor.execute("""CREATE TABLE IF NOT EXISTS flashcards 
@@ -31,7 +33,9 @@ def initialize_database():
                    difficulty TEXT,
                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                    last_reviewed TIMESTAMP,
-                   review_count INTEGER DEFAULT 0
+                   review_count INTEGER DEFAULT 0,
+                   leitner_box INTEGER DEFAULT 0,  -- Add Leitner box (0-5)
+                   next_review_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP  -- When to review next
                    )""")
 
     cursor.execute("""CREATE TABLE IF NOT EXISTS quiz_sessions 
@@ -54,9 +58,28 @@ def initialize_database():
                    FOREIGN KEY(flashcard_id) REFERENCES flashcards(id)
                    )""")
     conn.commit()
-
+    
+def upgrade_database():
+    """Upgrade existing database to add new columns if they don't exist"""
+    try:
+        # Check if leitner_box column exists
+        cursor.execute("PRAGMA table_info(flashcards)")
+        columns = [column[1] for column in cursor.fetchall()]
+        
+        if 'leitner_box' not in columns:
+            cursor.execute("ALTER TABLE flashcards ADD COLUMN leitner_box INTEGER DEFAULT 0")
+            st.sidebar.info("Added leitner_box column to database")
+        
+        if 'next_review_date' not in columns:
+            cursor.execute("ALTER TABLE flashcards ADD COLUMN next_review_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP")
+            st.sidebar.info("Added next_review_date column to database")
+            
+        conn.commit()
+    except Exception as e:
+        st.sidebar.error(f"Error upgrading database: {e}")
 # Initialize database tables
 initialize_database()
+upgrade_database()
 
 # --- TEXT PROCESSING FUNCTIONS ---
 def extract_text(file):
@@ -201,6 +224,69 @@ def parse_any_format(qa_text: str) -> Optional[List[str]]:
     
     return [question, correct, wrongs[0], wrongs[1]]
 
+# --- LEITNER ALGORITHM FUNCTIONS ---
+def update_leitner_box(card_id, is_correct):
+    """Update the Leitner box based on whether the answer was correct"""
+    try:
+        cursor.execute("SELECT leitner_box FROM flashcards WHERE id=?", (card_id,))
+        result = cursor.fetchone()
+        current_box = result[0] if result else 0
+        
+        if is_correct:
+            new_box = min(current_box + 1, 5)  # Move to next box, max is box 5
+        else:
+            new_box = max(current_box - 1, 0)  # Move back a box, min is box 0
+        
+        # Calculate next review date based on box number
+        intervals = [1, 2, 7, 14, 30, 90]  # Days until next review
+        next_review = datetime.now() + timedelta(days=intervals[new_box])
+        
+        cursor.execute(
+            """UPDATE flashcards 
+            SET leitner_box=?, next_review_date=?, last_reviewed=CURRENT_TIMESTAMP, review_count=review_count+1 
+            WHERE id=?""",
+            (new_box, next_review, card_id)
+        )
+        conn.commit()
+        return new_box
+    except sqlite3.OperationalError:
+        # If columns don't exist yet, just update the basic fields
+        cursor.execute(
+            """UPDATE flashcards 
+            SET last_reviewed=CURRENT_TIMESTAMP, review_count=review_count+1 
+            WHERE id=?""",
+            (card_id,)
+        )
+        conn.commit()
+        return 0
+
+def get_due_flashcards():
+    """Get flashcards that are due for review based on Leitner system"""
+    query = """SELECT * FROM flashcards 
+               WHERE next_review_date <= datetime('now') 
+               ORDER BY leitner_box ASC, next_review_date ASC"""
+    df = pd.read_sql_query(query, conn)
+    return df
+
+def get_leitner_stats():
+    """Get statistics about Leitner boxes"""
+    try:
+        # Check if leitner_box column exists
+        cursor.execute("PRAGMA table_info(flashcards)")
+        columns = [column[1] for column in cursor.fetchall()]
+        
+        if 'leitner_box' not in columns:
+            return pd.DataFrame(columns=['leitner_box', 'count'])
+            
+        query = """SELECT leitner_box, COUNT(*) as count 
+                   FROM flashcards 
+                   GROUP BY leitner_box 
+                   ORDER BY leitner_box"""
+        df = pd.read_sql_query(query, conn)
+        return df
+    except:
+        # If any error occurs, return empty DataFrame
+        return pd.DataFrame(columns=['leitner_box', 'count'])
 # --- DATABASE OPERATIONS ---
 def save_flashcard(question, correct, wrong1, wrong2, difficulty):
     """Saves a new flashcard to database"""
@@ -258,14 +344,17 @@ def add_question_to_quiz(session_id, flashcard_id):
     )
     conn.commit()
 
-def record_quiz_answer(question_id, user_answer, is_correct):
-    """Records a user's answer to a quiz question"""
+def record_quiz_answer(question_id, user_answer, is_correct, flashcard_id):
+    """Records a user's answer to a quiz question and updates Leitner box"""
     cursor.execute(
         """UPDATE quiz_questions 
         SET user_answer=?, is_correct=? 
         WHERE id=?""",
         (user_answer, is_correct, question_id)
     )
+    
+    # Update the Leitner box based on correctness
+    update_leitner_box(flashcard_id, is_correct)
     conn.commit()
 
 def complete_quiz_session(session_id, score):
@@ -475,6 +564,31 @@ def manage_flashcards_page():
     else:
         st.write(f"Found {len(df)} flashcards")
         
+        # Display Leitner stats
+        leitner_stats = get_leitner_stats()
+        if not leitner_stats.empty and not leitner_stats.isna().all().all():
+            st.subheader("Leitner System Progress")
+            col1, col2, col3 = st.columns(3)
+            
+            total_cards = leitner_stats['count'].sum()
+            mastered_cards = leitner_stats[leitner_stats['leitner_box'] == 5]['count'].sum() if 5 in leitner_stats['leitner_box'].values else 0
+            
+            with col1:
+                st.metric("Total Cards", total_cards)
+            with col2:
+                st.metric("Mastered Cards", mastered_cards)
+            with col3:
+                if total_cards > 0:
+                    st.metric("Mastery Rate", f"{(mastered_cards/total_cards)*100:.1f}%")
+            
+            # Show box distribution
+            fig = px.bar(leitner_stats, x='leitner_box', y='count', 
+                         title="Cards in Each Leitner Box",
+                         labels={'leitner_box': 'Leitner Box', 'count': 'Number of Cards'})
+            st.plotly_chart(fig)
+        else:
+            st.info("Leitner system statistics will appear after you start using the study system.")
+        
         # Display flashcards in individual expanders with edit options
         for index, row in df.iterrows():
             with st.expander(f"Card #{row['id']} ({row['difficulty']}): {row['question']}", expanded=False):
@@ -511,6 +625,103 @@ def manage_flashcards_page():
                             st.session_state.quiz_flashcards = []
                         st.session_state.quiz_flashcards.append(row['id'])
                         st.success("Added to quiz selection!")
+
+def leitner_study_page():
+    """Page for studying with the Leitner algorithm"""
+    st.title("📊 Leitner Study System")
+    st.info("Study your flashcards using the spaced repetition method. Cards you know well appear less often.")
+    
+    # Debugging and reset options
+    with st.sidebar.expander("Developer Tools"):
+        if st.button("🔄 Clear All Cache"):
+            st.cache_data.clear()
+            st.cache_resource.clear()
+            st.session_state.clear()
+            st.success("All caches cleared!")
+        
+        if st.button("💣 Reset Entire Database"):
+            initialize_database()
+            st.success("Database reset complete!")
+    
+    # Show Leitner statistics
+    stats_df = get_leitner_stats()
+    if not stats_df.empty and not stats_df.isna().all().all():
+        st.subheader("Your Progress")
+        col1, col2, col3 = st.columns(3)
+        
+        total_cards = stats_df['count'].sum()
+        mastered_cards = stats_df[stats_df['leitner_box'] == 5]['count'].sum() if 5 in stats_df['leitner_box'].values else 0
+        
+        with col1:
+            st.metric("Total Cards", total_cards)
+        with col2:
+            st.metric("Mastered Cards", mastered_cards)
+        with col3:
+            if total_cards > 0:
+                st.metric("Mastery Rate", f"{(mastered_cards/total_cards)*100:.1f}%")
+        
+        # Show box distribution
+        fig = px.bar(stats_df, x='leitner_box', y='count', 
+                     title="Cards in Each Leitner Box",
+                     labels={'leitner_box': 'Leitner Box', 'count': 'Number of Cards'})
+        st.plotly_chart(fig)
+    else:
+        st.info("Leitner system statistics will appear after you start studying.")
+    
+    # Get due flashcards
+    due_cards = get_due_flashcards()
+    
+    if due_cards.empty:
+        st.success("🎉 No flashcards due for review! You're all caught up.")
+        return
+    
+    st.subheader(f"Due for Review: {len(due_cards)} cards")
+    
+    # Study session
+    if "current_study_index" not in st.session_state:
+        st.session_state.current_study_index = 0
+        st.session_state.study_cards = due_cards.to_dict('records')
+        st.session_state.show_answer = False
+    
+    current_index = st.session_state.current_study_index
+    current_card = st.session_state.study_cards[current_index]
+    
+    # Display progress
+    progress = (current_index + 1) / len(st.session_state.study_cards)
+    st.progress(progress)
+    st.caption(f"Card {current_index + 1} of {len(st.session_state.study_cards)}")
+    
+    # Display question
+    st.subheader("Question")
+    st.write(current_card['question'])
+    
+    if not st.session_state.show_answer:
+        if st.button("Show Answer"):
+            st.session_state.show_answer = True
+            st.rerun()
+    else:
+        st.subheader("Answer")
+        st.success(current_card['correct_answer'])
+        
+        st.subheader("How did you do?")
+        col1, col2 = st.columns(2)
+        with col1:
+            if st.button("✅ I knew it", use_container_width=True):
+                update_leitner_box(current_card['id'], True)
+                next_card()
+        with col2:
+            if st.button("❌ I didn't know", use_container_width=True):
+                update_leitner_box(current_card['id'], False)
+                next_card()
+
+def next_card():
+    """Move to the next card in the study session"""
+    st.session_state.show_answer = False
+    if st.session_state.current_study_index < len(st.session_state.study_cards) - 1:
+        st.session_state.current_study_index += 1
+    else:
+        st.session_state.current_study_index = 0  # Restart or could end session
+    st.rerun()
 
 def quiz_page():
     """Page for taking and reviewing quizzes"""
@@ -718,6 +929,16 @@ def quiz_page():
                         score = int((correct / len(questions)) * 100)
                         complete_quiz_session(quiz["session_id"], score)
                         
+                        # Record answers in database
+                        for q in questions:
+                            user_ans = st.session_state.current_quiz["answers"].get(q['id'], "")
+                            is_correct = user_ans == next(key for key, val in [
+                                ("A", q['correct_answer']),
+                                ("B", q['wrong1']),
+                                ("C", q['wrong2'])
+                            ] if val == q['correct_answer'])
+                            record_quiz_answer(q['id'], user_ans, is_correct, q['flashcard_id'])
+                        
                         # Mark as completed
                         st.session_state.current_quiz["completed"] = True
                         st.session_state.current_quiz["current_question"] = 0
@@ -745,7 +966,7 @@ def main():
     st.sidebar.title("Navigation")
     page = st.sidebar.radio(
         "Go to",
-        ["Generate Flashcards", "Manage Flashcards", "Quiz Mode"],
+        ["Generate Flashcards", "Manage Flashcards", "Leitner Study", "Quiz Mode"],
         index=0
     )
     
@@ -754,6 +975,8 @@ def main():
         generate_flashcards_page()
     elif page == "Manage Flashcards":
         manage_flashcards_page()
+    elif page == "Leitner Study":
+        leitner_study_page()
     elif page == "Quiz Mode":
         quiz_page()
 
