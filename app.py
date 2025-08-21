@@ -12,6 +12,215 @@ import torch
 from transformers import pipeline
 import random
 import plotly.express as px
+import base64
+
+# --- THEME MANAGEMENT ---
+
+def set_custom_css():
+    """Set custom CSS for theme switching that properly handles all Streamlit components, including navbar"""
+    light_css = """
+    <style>
+    :root {
+        --primary-color: #2563EB;
+        --background-color: #F0F4F8;
+        --secondary-background-color: #FFFFFF;
+        --text-color: #1E293B;
+        --sidebar-background: #F0F4F8;
+        --sidebar-text: #1E293B;
+    }
+    
+    .stApp {
+        background-color: var(--background-color);
+        color: var(--text-color);
+    }
+    
+    /* Main content area */
+    .main .block-container {
+        background-color: var(--secondary-background-color);
+        color: var(--text-color);
+    }
+
+    /* Navbar / Header */
+    header[data-testid="stHeader"] {
+        background-color: var(--secondary-background-color) !important;
+        color: var(--text-color) !important;
+    }
+    header[data-testid="stHeader"] * {
+        color: var(--text-color) !important;
+    }
+
+    /* Tabs */
+    .stTabs [data-baseweb="tab"] {
+        color: var(--text-color) !important;
+    }
+
+    /* Sidebar */
+    section[data-testid="stSidebar"] {
+        background-color: var(--sidebar-background) !important;
+        color: var(--sidebar-text) !important;
+    }
+    section[data-testid="stSidebar"] * {
+        color: var(--sidebar-text) !important;
+    }
+    
+    /* Buttons */
+    .stButton>button {
+        border: 1px solid var(--primary-color);
+        color: var(--text-color);
+        background-color: var(--secondary-background-color);
+    }
+    
+    /* Text inputs */
+    .stTextInput>div>div>input, .stTextArea>div>div>textarea {
+        color: var(--text-color);
+        background-color: var(--secondary-background-color);
+    }
+    
+    /* Select boxes */
+    .stSelectbox>div>div>select {
+        color: var(--text-color);
+        background-color: var(--secondary-background-color);
+    }
+    
+    /* Radio buttons */
+    .stRadio>div>label {
+        color: var(--text-color);
+    }
+    
+    /* Expanders */
+    .streamlit-expanderHeader {
+        color: var(--text-color);
+        background-color: var(--secondary-background-color);
+    }
+    
+    /* Dataframes and tables */
+    .dataframe {
+        color: var(--text-color);
+        background-color: var(--secondary-background-color);
+    }
+    
+    /* Plotly chart background */
+    .js-plotly-plot .plotly, .js-plotly-plot .plotly div {
+        background-color: var(--secondary-background-color) !important;
+        color: var(--text-color) !important;
+    }
+    
+    /* Plotly text */
+    .js-plotly-plot .plotly .modebar, .js-plotly-plot .plotly .modebar-btn {
+        background-color: var(--secondary-background-color) !important;
+        color: var(--text-color) !important;
+    }
+    </style>
+    """
+    
+    dark_css = """
+    <style>
+    :root {
+        --primary-color: #3B82F6;
+        --background-color: #0F172A;
+        --secondary-background-color: #1E293B;
+        --text-color: #F1F5F9;
+        --sidebar-background: #0F172A;
+        --sidebar-text: #F1F5F9;
+    }
+    
+    .stApp {
+        background-color: var(--background-color);
+        color: var(--text-color);
+    }
+    
+    /* Main content area */
+    .main .block-container {
+        background-color: var(--secondary-background-color);
+        color: var(--text-color);
+    }
+
+    /* Navbar / Header */
+    header[data-testid="stHeader"] {
+        background-color: var(--secondary-background-color) !important;
+        color: var(--text-color) !important;
+    }
+    header[data-testid="stHeader"] * {
+        color: var(--text-color) !important;
+    }
+
+    /* Tabs */
+    .stTabs [data-baseweb="tab"] {
+        color: var(--text-color) !important;
+    }
+
+    /* Sidebar */
+    section[data-testid="stSidebar"] {
+        background-color: var(--sidebar-background) !important;
+        color: var(--sidebar-text) !important;
+    }
+    section[data-testid="stSidebar"] * {
+        color: var(--sidebar-text) !important;
+    }
+    
+    /* Buttons */
+    .stButton>button {
+        border: 1px solid var(--primary-color);
+        color: var(--text-color);
+        background-color: var(--secondary-background-color);
+    }
+    
+    /* Text inputs */
+    .stTextInput>div>div>input, .stTextArea>div>div>textarea {
+        color: var(--text-color);
+        background-color: var(--secondary-background-color);
+    }
+    
+    /* Select boxes */
+    .stSelectbox>div>div>select {
+        color: var(--text-color);
+        background-color: var(--secondary-background-color);
+    }
+    
+    /* Radio buttons */
+    .stRadio>div>label {
+        color: var(--text-color);
+    }
+    
+    /* Expanders */
+    .streamlit-expanderHeader {
+        color: var(--text-color);
+        background-color: var(--secondary-background-color);
+    }
+    
+    /* Dataframes and tables */
+    .dataframe {
+        color: var(--text-color);
+        background-color: var(--secondary-background-color);
+    }
+    
+    /* Plotly chart background */
+    .js-plotly-plot .plotly, .js-plotly-plot .plotly div {
+        background-color: var(--secondary-background-color) !important;
+        color: var(--text-color) !important;
+    }
+    
+    /* Plotly text */
+    .js-plotly-plot .plotly .modebar, .js-plotly-plot .plotly .modebar-btn {
+        background-color: var(--secondary-background-color) !important;
+        color: var(--text-color) !important;
+    }
+    </style>
+    """
+    
+    # Apply the appropriate CSS based on the current theme
+    if st.session_state.get("theme", "light") == "dark":
+        st.markdown(dark_css, unsafe_allow_html=True)
+    else:
+        st.markdown(light_css, unsafe_allow_html=True)
+
+def toggle_theme():
+    """Toggle between light and dark theme"""
+    if st.session_state.get("theme", "light") == "light":
+        st.session_state.theme = "dark"
+    else:
+        st.session_state.theme = "light"
+    set_custom_css()
 
 # --- SQLite SETUP ---
 # Connect SQLite database file for storing flashcards and quiz data
@@ -962,13 +1171,29 @@ def main():
         layout="centered"
     )
     
+    # Initialize theme if not set
+    if "theme" not in st.session_state:
+        st.session_state.theme = "light"
+    
+    # Apply custom CSS
+    set_custom_css()
+    
     # Sidebar navigation
-    st.sidebar.title("Navigation")
+    st.sidebar.title("📚 Learn-with-me App")
     page = st.sidebar.radio(
         "Go to",
         ["Generate Flashcards", "Manage Flashcards", "Leitner Study", "Quiz Mode"],
         index=0
     )
+    
+    # Add theme toggle button to sidebar
+    st.sidebar.markdown("---")
+    theme_icon = "🌙" if st.session_state.theme == "light" else "☀️"
+    theme_text = "Switch to Dark Mode" if st.session_state.theme == "light" else "Switch to Light Mode"
+    
+    if st.sidebar.button(f"{theme_icon} {theme_text}", use_container_width=True):
+        toggle_theme()
+        st.rerun()
     
     # Display the selected page
     if page == "Generate Flashcards":
