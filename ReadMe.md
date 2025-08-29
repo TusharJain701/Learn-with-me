@@ -30,7 +30,7 @@ A comprehensive AI-powered learning application that automatically generates fla
 ## 🛠️ Installation
 
 1. 📥 **Clone the repository:**
-git clone https://github.com/your-username/learn-with-me.git
+git clone https://github.com/TusharJain701/learn-with-me.git
 
 cd learn-with-me
 
